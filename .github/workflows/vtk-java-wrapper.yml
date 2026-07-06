@@ -123,10 +123,29 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install p7zip
 
+      # VTK's Java build has jar-timing handling that ONLY activates under the
+      # Ninja generator (see Wrapping/Java/CMakeLists.txt: the vtkjava_jar
+      # custom target is guarded by `if (CMAKE_GENERATOR MATCHES "Ninja")`).
+      # Under the Visual Studio generator, INSTALL.vcxproj races vtk.jar
+      # creation and fails with the paradoxical "cannot find ...: File exists".
+      # So on Windows we build with Ninja + MSVC instead of the VS generator.
+      # This step puts cl.exe/link.exe on PATH for the whole job.
+      - name: Set up MSVC developer environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Configure
         shell: bash
         run: |
-          cmake -B build -S . \
+          # On Windows use Ninja (see MSVC setup step above for why). Ninja is
+          # preinstalled on GitHub Windows runners. Ninja is single-config, so
+          # CMAKE_BUILD_TYPE drives the config there; the VS-style --config is
+          # harmless-but-ignored under Ninja and used by multi-config elsewhere.
+          GEN_ARGS=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            GEN_ARGS="-G Ninja"
+          fi
+          cmake -B build -S . $GEN_ARGS \
             -DVTK_BUILD_SHARED_LIBS=ON \
             -DVTK_ENABLE_KITS=ON \
             -DVTK_WRAP_JAVA=ON \
@@ -200,21 +219,38 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          lib=$(find install_root build \
-            \( -name 'libvtkCommonJava.*' -o -name 'libvtkFiltersJava.*' \) \
-            -type f 2>/dev/null | head -1)
-          if [ -z "$lib" ]; then
-            echo "FAIL: no kit JNI lib (vtkCommonJava/vtkFiltersJava) found." >&2
+          # Name-agnostic: find ANY JNI wrapper lib rather than assuming kit or
+          # module names. VTK names JNI libs "<library_name>Java" and emits one
+          # per wrapped module; extension is .so on Linux, .dylib or .jnilib on
+          # macOS. We just need one that exports Java_* entry points to prove
+          # the wrapper linkage is intact.
+          mapfile -t libs < <(find install_root build \
+            \( -name '*Java.so' -o -name '*Java.so.*' \
+               -o -name '*Java.dylib' -o -name '*Java.jnilib' \) \
+            -type f 2>/dev/null | sort -u)
+
+          if [ "${#libs[@]}" -eq 0 ]; then
+            echo "FAIL: no *Java JNI wrapper libs found at all." >&2
+            echo "--- everything named *Java* under install_root/build ---" >&2
+            find install_root build -name '*Java*' 2>/dev/null | head -50 >&2 || true
+            echo "--- all native libs ---" >&2
+            find install_root build \( -name '*.so' -o -name '*.so.*' \
+              -o -name '*.dylib' -o -name '*.jnilib' \) 2>/dev/null | head -50 >&2 || true
             exit 1
           fi
-          echo "Inspecting $lib"
-          # -D dynamic symbols on ELF; plain -g on Mach-O. Try both.
-          count=$( (nm -D "$lib" 2>/dev/null || nm -g "$lib" 2>/dev/null) \
-                   | grep -c ' T Java_' || true )
-          echo "Exported Java_ entry points: $count"
-          if [ "$count" -eq 0 ]; then
-            echo "FAIL: no Java_* JNI entry points exported — the wrapper would" >&2
-            echo "throw UnsatisfiedLinkError at runtime." >&2
+
+          echo "Found ${#libs[@]} JNI wrapper lib(s). Checking for Java_ exports..."
+          total=0
+          for lib in "${libs[@]}"; do
+            c=$( (nm -D "$lib" 2>/dev/null || nm -g "$lib" 2>/dev/null) \
+                 | grep -c ' T Java_' || true )
+            printf "  %-60s %s Java_ symbols\n" "$(basename "$lib")" "$c"
+            total=$((total + c))
+          done
+          echo "Total Java_ entry points across all JNI libs: $total"
+          if [ "$total" -eq 0 ]; then
+            echo "FAIL: JNI libs exist but export no Java_* entry points —" >&2
+            echo "native calls would throw UnsatisfiedLinkError at runtime." >&2
             exit 1
           fi
           echo "OK: JNI entry points present."
