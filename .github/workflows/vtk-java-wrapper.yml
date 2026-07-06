@@ -16,9 +16,10 @@ permissions:
   contents: read
 
 env:
-  # JOGL version to fetch for the JOGL Swing/AWT component. VTK's own CI pins
-  # 2.6.0; FindJOGL.cmake defaults to 2.3.2 if not told otherwise. We fetch
-  # this exact pair of jars and hand their directory to CMake.
+  # JOGL version for the JOGL Swing/AWT component. 2.6.0 matches the version
+  # VTK's own CI pins, so it's the version the maintainers test against.
+  # Confirmed present on Maven Central (repo1.maven.org), which we fetch from
+  # first; jogamp.org is an unreliable-from-CI fallback.
   JOGL_VERSION: '2.6.0'
 
 jobs:
@@ -65,13 +66,47 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/jogl"
-          base="https://jogamp.org/deployment/maven/org/jogamp"
-          curl -fL --retry 3 -o "$GITHUB_WORKSPACE/jogl/jogl-all-${JOGL_VERSION}.jar" \
-            "${base}/jogl/jogl-all/${JOGL_VERSION}/jogl-all-${JOGL_VERSION}.jar"
-          curl -fL --retry 3 -o "$GITHUB_WORKSPACE/jogl/gluegen-rt-${JOGL_VERSION}.jar" \
-            "${base}/gluegen/gluegen-rt/${JOGL_VERSION}/gluegen-rt-${JOGL_VERSION}.jar"
-          ls -l "$GITHUB_WORKSPACE/jogl"
+          dest="$GITHUB_WORKSPACE/jogl"
+          mkdir -p "$dest"
+
+          # Try each mirror in turn until both jars are fetched. Maven Central
+          # is fast and reliable from GitHub runners; jogamp.org is the origin
+          # but frequently times out from CI, so it's the fallback, not primary.
+          central="https://repo1.maven.org/maven2/org/jogamp"
+          jogamp="https://jogamp.org/deployment/maven/org/jogamp"
+
+          fetch_one () {
+            # $1 = output path, $2... = candidate URLs
+            local out="$1"; shift
+            local url
+            for url in "$@"; do
+              echo "Trying: $url"
+              if curl -fL --connect-timeout 20 --retry 2 -o "$out" "$url"; then
+                echo "  -> OK"
+                return 0
+              fi
+              echo "  -> failed, trying next mirror"
+            done
+            return 1
+          }
+
+          fetch_one "$dest/jogl-all-${JOGL_VERSION}.jar" \
+            "${central}/jogl/jogl-all/${JOGL_VERSION}/jogl-all-${JOGL_VERSION}.jar" \
+            "${jogamp}/jogl/jogl-all/${JOGL_VERSION}/jogl-all-${JOGL_VERSION}.jar"
+
+          fetch_one "$dest/gluegen-rt-${JOGL_VERSION}.jar" \
+            "${central}/gluegen/gluegen-rt/${JOGL_VERSION}/gluegen-rt-${JOGL_VERSION}.jar" \
+            "${jogamp}/gluegen/gluegen-rt/${JOGL_VERSION}/gluegen-rt-${JOGL_VERSION}.jar"
+
+          echo "=== fetched ==="
+          ls -l "$dest"
+          # Sanity: both jars must be non-empty, or configure will SEND_ERROR.
+          for f in "$dest/jogl-all-${JOGL_VERSION}.jar" "$dest/gluegen-rt-${JOGL_VERSION}.jar"; do
+            if [ ! -s "$f" ]; then
+              echo "FAIL: $f missing or empty after all mirrors." >&2
+              exit 1
+            fi
+          done
 
       # System OpenGL headers/libs are needed for the Rendering group on Linux.
       # macOS ships OpenGL in a framework; Windows has opengl32 with the SDK.
@@ -258,4 +293,3 @@ jobs:
         uses: geekyeggo/delete-artifact@v5
         with:
           name: vtk-java-*
-
