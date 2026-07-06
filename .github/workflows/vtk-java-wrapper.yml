@@ -224,12 +224,25 @@ jobs:
           # per wrapped module; extension is .so on Linux, .dylib or .jnilib on
           # macOS. We just need one that exports Java_* entry points to prove
           # the wrapper linkage is intact.
-          mapfile -t libs < <(find install_root build \
-            \( -name '*Java.so' -o -name '*Java.so.*' \
-               -o -name '*Java.dylib' -o -name '*Java.jnilib' \) \
-            -type f 2>/dev/null | sort -u)
+          #
+          # NOTE: no `mapfile`/`readarray` here — those are Bash 4+ builtins and
+          # macOS ships Bash 3.2. We collect matches into a plain loop instead,
+          # counting and summing as we go, so it runs on both Bash versions.
+          found=0
+          total=0
+          while IFS= read -r lib; do
+            [ -n "$lib" ] || continue
+            found=$((found + 1))
+            c=$( (nm -D "$lib" 2>/dev/null || nm -g "$lib" 2>/dev/null) \
+                 | grep -c ' T Java_' || true )
+            printf "  %-60s %s Java_ symbols\n" "$(basename "$lib")" "$c"
+            total=$((total + c))
+          done < <(find install_root build \
+                     \( -name '*Java.so' -o -name '*Java.so.*' \
+                        -o -name '*Java.dylib' -o -name '*Java.jnilib' \) \
+                     -type f 2>/dev/null | sort -u)
 
-          if [ "${#libs[@]}" -eq 0 ]; then
+          if [ "$found" -eq 0 ]; then
             echo "FAIL: no *Java JNI wrapper libs found at all." >&2
             echo "--- everything named *Java* under install_root/build ---" >&2
             find install_root build -name '*Java*' 2>/dev/null | head -50 >&2 || true
@@ -239,14 +252,7 @@ jobs:
             exit 1
           fi
 
-          echo "Found ${#libs[@]} JNI wrapper lib(s). Checking for Java_ exports..."
-          total=0
-          for lib in "${libs[@]}"; do
-            c=$( (nm -D "$lib" 2>/dev/null || nm -g "$lib" 2>/dev/null) \
-                 | grep -c ' T Java_' || true )
-            printf "  %-60s %s Java_ symbols\n" "$(basename "$lib")" "$c"
-            total=$((total + c))
-          done
+          echo "Found $found JNI wrapper lib(s)."
           echo "Total Java_ entry points across all JNI libs: $total"
           if [ "$total" -eq 0 ]; then
             echo "FAIL: JNI libs exist but export no Java_* entry points —" >&2
