@@ -132,6 +132,7 @@ jobs:
             -DVTK_WRAP_JAVA=ON \
             -DVTK_JAVA_JOGL_COMPONENT=ON \
             -DJOGL_VERSION="${JOGL_VERSION}" \
+            -DJOGL_EXTRA_VERSIONS="${JOGL_VERSION}" \
             -DJava_JAR_PATHS="${GITHUB_WORKSPACE}/jogl" \
             -DCMAKE_BUILD_TYPE=Release \
             -DVTK_BUILD_TESTING=OFF \
