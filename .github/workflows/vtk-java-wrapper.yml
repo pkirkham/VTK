@@ -1,1 +1,261 @@
+name: VTK Java Wrapper
+
+on:
+  push:
+    branches: [ 'master', 'main', 'develop' ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ 'master', 'main', 'develop' ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/develop' && !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  # JOGL version to fetch for the JOGL Swing/AWT component. VTK's own CI pins
+  # 2.6.0; FindJOGL.cmake defaults to 2.3.2 if not told otherwise. We fetch
+  # this exact pair of jars and hand their directory to CMake.
+  JOGL_VERSION: '2.6.0'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            sysname: Linux
+          - os: windows-latest
+            sysname: Windows
+          - os: macos-latest
+            sysname: Darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # VTK vendors third-party libs in-tree (not submodules), so recursive
+          # checkout isn't strictly required, but it's harmless and future-proof.
+          submodules: recursive
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          # Aligned with the Zulu 25 JRE the downstream application bundles.
+          # Note: VTK pins its wrapper classes to `--release 8` bytecode
+          # regardless (VTK_JAVA_RELEASE_VERSION defaults to 8), so vtk.jar is
+          # loadable by any JRE 8+; aligning the build JDK is for toolchain
+          # tidiness and runtime parity, not to avoid UnsupportedClassVersionError.
+          java-version: '25'
+          distribution: 'zulu'
+          java-package: 'jdk'
+
+      # ----------------------------------------------------------------------
+      # JOGL jars. VTK_JAVA_JOGL_COMPONENT=ON makes CMake SEND_ERROR at
+      # configure time if it cannot find jogl-all-<ver>.jar and
+      # gluegen-rt-<ver>.jar. FindJOGL.cmake searches Java_JAR_PATHS via
+      # find_jar, matching NAMES "jogl-all"/"gluegen-rt" with the version
+      # appended. We download both into a known dir and pass it through
+      # -DJava_JAR_PATHS so the finder locates them.
+      # ----------------------------------------------------------------------
+      - name: Fetch JOGL jars
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/jogl"
+          base="https://jogamp.org/deployment/maven/org/jogamp"
+          curl -fL --retry 3 -o "$GITHUB_WORKSPACE/jogl/jogl-all-${JOGL_VERSION}.jar" \
+            "${base}/jogl/jogl-all/${JOGL_VERSION}/jogl-all-${JOGL_VERSION}.jar"
+          curl -fL --retry 3 -o "$GITHUB_WORKSPACE/jogl/gluegen-rt-${JOGL_VERSION}.jar" \
+            "${base}/gluegen/gluegen-rt/${JOGL_VERSION}/gluegen-rt-${JOGL_VERSION}.jar"
+          ls -l "$GITHUB_WORKSPACE/jogl"
+
+      # System OpenGL headers/libs are needed for the Rendering group on Linux.
+      # macOS ships OpenGL in a framework; Windows has opengl32 with the SDK.
+      - name: Install OpenGL + X11 dev packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            libgl1-mesa-dev libglu1-mesa-dev \
+            libx11-dev libxt-dev libxrender-dev libxext-dev \
+            libxcursor-dev p7zip-full
+
+      - name: Install 7zip (macOS)
+        if: runner.os == 'macOS'
+        run: brew install p7zip
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -B build -S . \
+            -DVTK_BUILD_SHARED_LIBS=ON \
+            -DVTK_ENABLE_KITS=ON \
+            -DVTK_WRAP_JAVA=ON \
+            -DVTK_JAVA_JOGL_COMPONENT=ON \
+            -DJOGL_VERSION="${JOGL_VERSION}" \
+            -DJava_JAR_PATHS="${GITHUB_WORKSPACE}/jogl" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVTK_BUILD_TESTING=OFF \
+            -DVTK_BUILD_EXAMPLES=OFF \
+            -DVTK_BUILD_ALL_MODULES=OFF \
+            -DVTK_GROUP_ENABLE_StandAlone=YES \
+            -DVTK_GROUP_ENABLE_Rendering=WANT \
+            -DVTK_GROUP_ENABLE_Imaging=WANT \
+            -DVTK_GROUP_ENABLE_Views=DONT_WANT \
+            -DVTK_GROUP_ENABLE_Web=DONT_WANT \
+            -DVTK_GROUP_ENABLE_Qt=DONT_WANT \
+            -DVTK_GROUP_ENABLE_Parallel=DONT_WANT \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/install_root"
+
+      # Fail loudly if the dependent-option silently forced kits OFF (which
+      # happens if VTK_BUILD_SHARED_LIBS didn't take). Without this you'd only
+      # notice by counting 150 JNI libs at the end.
+      - name: Assert kits are enabled
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -q "^VTK_ENABLE_KITS:BOOL=ON" build/CMakeCache.txt; then
+            echo "FAIL: VTK_ENABLE_KITS is not ON in the cache — kits were" >&2
+            echo "force-disabled (likely VTK_BUILD_SHARED_LIBS is OFF)." >&2
+            grep -E "VTK_ENABLE_KITS|VTK_BUILD_SHARED_LIBS" build/CMakeCache.txt >&2 || true
+            exit 1
+          fi
+          echo "OK: kits enabled."
+
+      - name: Build and install
+        shell: bash
+        # Bound parallelism to core count. VTK is large; a bare -j can exhaust
+        # RAM on the 16 GB runners and get OOM-killed (exit 143). nproc is
+        # Linux/Git-Bash; macOS uses sysctl; fall back to a constant.
+        run: |
+          JOBS=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 2)
+          cmake --build build --target install --config Release -j "$JOBS"
+
+      # Diagnostic: how many native libs did we actually produce? With kits on
+      # this should be a small number (~9 kit JNI libs + a few unkitted +
+      # bundled third-party), NOT ~150. Printed for visibility, not gated hard
+      # (the exact count shifts with the module set).
+      - name: Report native library count
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== JNI wrapper libs (*Java.*) ==="
+          find install_root build \( -name '*Java.so' -o -name '*Java.so.*' \
+            -o -name '*Java.dylib' -o -name '*Java.jnilib' -o -name '*Java.dll' \) \
+            2>/dev/null | sort || true
+          echo "=== all native libs under install_root ==="
+          find install_root \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \
+            -o -name '*.dll' \) 2>/dev/null | wc -l
+          echo "=== vtk.jar ==="
+          find install_root build -name 'vtk.jar' 2>/dev/null || true
+
+      # JNI-symbol presence gate — the Route-A analogue of your CoolProp JSON
+      # symbol-leak gate. Whole-program consolidation (kits here) can silently
+      # drop the Java_vtk_* entry points if link visibility is wrong; if they're
+      # gone the jar loads but every native call throws UnsatisfiedLinkError at
+      # runtime. Assert at least one kit JNI lib actually exports Java_ symbols.
+      # nm-based → ELF/Mach-O only; Windows PE is skipped (same as your gate).
+      - name: JNI symbol presence gate (Linux/macOS)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          lib=$(find install_root build \
+            \( -name 'libvtkCommonJava.*' -o -name 'libvtkFiltersJava.*' \) \
+            -type f 2>/dev/null | head -1)
+          if [ -z "$lib" ]; then
+            echo "FAIL: no kit JNI lib (vtkCommonJava/vtkFiltersJava) found." >&2
+            exit 1
+          fi
+          echo "Inspecting $lib"
+          # -D dynamic symbols on ELF; plain -g on Mach-O. Try both.
+          count=$( (nm -D "$lib" 2>/dev/null || nm -g "$lib" 2>/dev/null) \
+                   | grep -c ' T Java_' || true )
+          echo "Exported Java_ entry points: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "FAIL: no Java_* JNI entry points exported — the wrapper would" >&2
+            echo "throw UnsatisfiedLinkError at runtime." >&2
+            exit 1
+          fi
+          echo "OK: JNI entry points present."
+
+      - name: Upload per-OS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vtk-java-${{ matrix.sysname }}
+          # The whole install tree: native libs live under lib/java/... and the
+          # jar under lib/java/. Uploading install_root keeps the layout intact.
+          path: install_root
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Download per-OS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vtk-java-*
+          path: staging
+
+      # Assemble a single distributable tree:
+      #   dist/vtk.jar                          (platform-independent; ship once)
+      #   dist/natives/Linux/*.so
+      #   dist/natives/Darwin/*.dylib
+      #   dist/natives/Windows/*.dll
+      # vtk.jar is pure Java and identical across OSes, so we keep one copy and
+      # fail if the copies diverge (a sign the module set differed per-OS).
+      - name: Assemble unified distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/natives
+
+          jar_hash=""
+          for d in staging/vtk-java-*/; do
+            sys="${d#staging/vtk-java-}"; sys="${sys%/}"
+
+            # --- one shared vtk.jar ---
+            found_jar=$(find "$d" -name 'vtk.jar' | head -1 || true)
+            if [ -n "$found_jar" ]; then
+              h=$(sha256sum "$found_jar" | cut -d' ' -f1)
+              if [ -z "$jar_hash" ]; then
+                jar_hash="$h"
+                cp "$found_jar" dist/vtk.jar
+              elif [ "$h" != "$jar_hash" ]; then
+                echo "WARN: vtk.jar from $sys differs from the first one." >&2
+                echo "      (module set may differ across platforms)" >&2
+              fi
+            fi
+
+            # --- per-OS native libs ---
+            mkdir -p "dist/natives/${sys}"
+            find "$d" \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \
+              -o -name '*.jnilib' -o -name '*.dll' \) -type f \
+              -exec cp {} "dist/natives/${sys}/" \; 2>/dev/null || true
+          done
+
+          echo "=== assembled distribution ==="
+          find dist -type f | sort
+          echo "=== native lib counts per platform ==="
+          for p in dist/natives/*/; do
+            printf "%s: %d libs\n" "$(basename "$p")" "$(find "$p" -type f | wc -l)"
+          done
+
+      - name: Upload unified VTK Java artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vtk-java-all-platforms
+          path: dist
+
+      - name: Delete intermediate per-OS artifacts
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: vtk-java-*
 
