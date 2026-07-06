@@ -36,14 +36,14 @@ jobs:
             sysname: Darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # VTK vendors third-party libs in-tree (not submodules), so recursive
           # checkout isn't strictly required, but it's harmless and future-proof.
           submodules: recursive
 
       - name: Setup Java JDK
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5.4.0
         with:
           # Aligned with the Zulu 25 JRE the downstream application bundles.
           # Note: VTK pins its wrapper classes to `--release 8` bytecode
@@ -256,7 +256,7 @@ jobs:
           echo "OK: JNI entry points present."
 
       - name: Upload per-OS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vtk-java-${{ matrix.sysname }}
           # The whole install tree: native libs live under lib/java/... and the
@@ -271,7 +271,7 @@ jobs:
       actions: write
     steps:
       - name: Download per-OS artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: vtk-java-*
           path: staging
@@ -321,12 +321,12 @@ jobs:
           done
 
       - name: Upload unified VTK Java artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vtk-java-all-platforms
           path: dist
 
       - name: Delete intermediate per-OS artifacts
-        uses: geekyeggo/delete-artifact@v5
+        uses: geekyeggo/delete-artifact@v6
         with:
           name: vtk-java-*
