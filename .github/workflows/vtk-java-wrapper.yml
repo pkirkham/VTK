@@ -233,8 +233,18 @@ jobs:
           while IFS= read -r lib; do
             [ -n "$lib" ] || continue
             found=$((found + 1))
-            c=$( (nm -D "$lib" 2>/dev/null || nm -g "$lib" 2>/dev/null) \
-                 | grep -c ' T Java_' || true )
+            # nm format differs by platform:
+            #   Linux (GNU nm):  "<addr> T Java_vtk..."   -D lists dynamic syms
+            #   macOS (LLVM nm): "<addr> T _Java_vtk..."  Mach-O prepends '_',
+            #                     and -D is not a macOS flag.
+            # Use ONE nm invocation (fallback chain, not concatenation — running
+            # two and concatenating would double-count). Match a 'T' text symbol
+            # named Java_ OR _Java_ (optional leading underscore) so one pattern
+            # works on both platforms.
+            syms=$(nm -D "$lib" 2>/dev/null) || syms=""
+            [ -n "$syms" ] || syms=$(nm -g "$lib" 2>/dev/null) || syms=""
+            [ -n "$syms" ] || syms=$(nm "$lib" 2>/dev/null) || syms=""
+            c=$(printf '%s\n' "$syms" | grep -Ec ' T _?Java_' || true)
             printf "  %-60s %s Java_ symbols\n" "$(basename "$lib")" "$c"
             total=$((total + c))
           done < <(find install_root build \
