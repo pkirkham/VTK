@@ -21,7 +21,11 @@ env:
   # Confirmed present on Maven Central (repo1.maven.org), which we fetch from
   # first; jogamp.org is an unreliable-from-CI fallback.
   JOGL_VERSION: '2.6.0'
-
+  # Route the compiler through sccache and cap the on-disk cache so it fits
+  # within GitHub's ~10 GB per-repo Actions cache budget across 3 platforms.
+  SCCACHE_GHA_ENABLED: 'true'
+  SCCACHE_CACHE_SIZE: '2G'
+  
 jobs:
   build:
     strategy:
@@ -134,6 +138,9 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
       - name: Configure
         shell: bash
         run: |
@@ -164,7 +171,11 @@ jobs:
             -DVTK_GROUP_ENABLE_Web=DONT_WANT \
             -DVTK_GROUP_ENABLE_Qt=DONT_WANT \
             -DVTK_GROUP_ENABLE_Parallel=DONT_WANT \
-            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/install_root"
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/install_root" \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded \
+            -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
 
       # Fail loudly if the dependent-option silently forced kits OFF (which
       # happens if VTK_BUILD_SHARED_LIBS didn't take). Without this you'd only
@@ -189,6 +200,10 @@ jobs:
         run: |
           JOBS=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 2)
           cmake --build build --target install --config Release -j "$JOBS"
+
+      - name: sccache stats
+        shell: bash
+        run: sccache --show-stats
 
       # Diagnostic: how many native libs did we actually produce? With kits on
       # this should be a small number (~9 kit JNI libs + a few unkitted +
@@ -274,7 +289,7 @@ jobs:
       - name: Upload per-OS artifact
         uses: actions/upload-artifact@v7
         with:
-          name: vtk-java-${{ matrix.sysname }}
+          name: vtk-perOS-${{ matrix.sysname }}
           # The whole install tree: native libs live under lib/java/... and the
           # jar under lib/java/. Uploading install_root keeps the layout intact.
           path: install_root
@@ -289,7 +304,7 @@ jobs:
       - name: Download per-OS artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: vtk-java-*
+          pattern: vtk-perOS-*
           path: staging
 
       # Assemble a single distributable tree:
@@ -306,8 +321,8 @@ jobs:
           mkdir -p dist/natives
 
           jar_hash=""
-          for d in staging/vtk-java-*/; do
-            sys="${d#staging/vtk-java-}"; sys="${sys%/}"
+          for d in staging/vtk-perOS-*/; do
+            sys="${d#staging/vtk-perOS-}"; sys="${sys%/}"
 
             # --- one shared vtk.jar ---
             found_jar=$(find "$d" -name 'vtk.jar' | head -1 || true)
@@ -345,4 +360,4 @@ jobs:
       - name: Delete intermediate per-OS artifacts
         uses: geekyeggo/delete-artifact@v6
         with:
-          name: vtk-java-*
+          name: vtk-perOS-*
