@@ -368,64 +368,123 @@ jobs:
           java --enable-native-access=ALL-UNNAMED \
             -cp "smoke-out${SEP}${jar}" -Dvtk.lib.dir="$libdir" VtkSmokeTest
 
-      # TEMPORARY DIAGNOSTIC — remove once the SONAME/install-name trim is built.
-      # Prints the real linkage recorded INSIDE the binaries (not filenames) so
-      # we can key the trim on ground truth. On a triple like
-      #   libvtkcgns-9.6.dylib / -9.6.1.dylib / -9.6.9.6.dylib
-      # this shows which name each lib advertises (install name / SONAME) and
-      # which name its dependents actually ask for (LC_LOAD_DYLIB / NEEDED).
-      # Linux+macOS only; Windows DLLs don't use the versioned-symlink scheme.
-      - name: Inspect library linkage (diagnostic, Linux/macOS)
-        if: runner.os == 'Linux' || runner.os == 'macOS'
+      # FLATTEN native libraries into a single clean directory per platform.
+      #
+      # Problem this solves: VTK installs versioned libs as a symlink chain
+      #   libvtkcgns-9.6.so       -> ...so.1      (linker/dev name)
+      #   libvtkcgns-9.6.so.1     -> ...so.9.6    (SONAME — what the loader wants)
+      #   libvtkcgns-9.6.so.9.6                   (the real file)
+      # actions/upload-artifact DEREFERENCES symlinks, turning that into THREE
+      # full copies (the 3x bloat: Linux 706 MB, macOS 603 MB). We instead keep
+      # exactly ONE real file per library, named as its advertised runtime name:
+      #   * Linux: the SONAME      (readelf -d ... SONAME)
+      #   * macOS: the install name basename (otool -D)
+      #   * JNI libs have no SONAME/install-name -> keep their own filename.
+      # This is Option B: CI emits precisely what Pyrus consumes, one file each.
+      #
+      # Windows has NO symlink scheme (each DLL is a single versioned file), so
+      # we just copy the DLLs as-is.
+      #
+      # Runs while the symlink structure is still intact (BEFORE upload), and
+      # gathers from BOTH lib dirs: the C++/third-party libs (lib/) and the JNI
+      # wrapper libs (lib/java/vtk-<platform>/), plus vtk.jar.
+      # ----------------------------------------------------------------------
+      - name: Flatten native libraries
         shell: bash
         run: |
           set -euo pipefail
-          libdir=$(find install_root build -type d -name 'vtk-*-*' 2>/dev/null \
-                   | grep -E '/java/vtk-[^/]+-[^/]+$' | head -1)
-          # Also inspect the C++ lib dir (the kits/third-party live here; the
-          # cgns triple you saw is a bundled third-party lib, not a JNI lib).
-          cxxdir=$(find install_root -type d -name lib 2>/dev/null | head -1)
-          echo "JNI dir: $libdir"
-          echo "C++ dir: $cxxdir"
+          out="dist-native"
+          mkdir -p "$out"
 
-          echo "=== count of files that look like versioned duplicates ==="
-          find install_root -type f \( -name '*.so.*' -o -name '*-*.*.dylib' \) 2>/dev/null | wc -l
+          # advertised_name <file> -> echoes the runtime name to keep it under.
+          advertised_name () {
+            local f="$1" name=""
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              # otool -D prints a header line then the install name; take the
+              # last non-empty line and strip any @rpath/ (or path) prefix.
+              local instname
+              instname=$(otool -D "$f" 2>/dev/null | tail -1 || true)
+              if [ -n "$instname" ] && [ "$instname" != "$f:" ]; then
+                name=$(basename "$instname")
+              fi
+            else
+              # Linux: SONAME if present.
+              name=$(readelf -d "$f" 2>/dev/null | grep SONAME \
+                     | sed -E 's/.*\[(.*)\].*/\1/' || true)
+            fi
+            # Fallback: no SONAME/install-name (e.g. JNI libs) -> own basename.
+            [ -n "$name" ] || name=$(basename "$f")
+            printf '%s' "$name"
+          }
 
-          echo "=== sample: all files in the cgns triple ==="
-          find install_root -name 'libvtkcgns*' 2>/dev/null | sort
+          copy_real_libs () {
+            # $1 = dir to scan, $2... = find name-patterns
+            local dir="$1"; shift
+            [ -d "$dir" ] || return 0
+            # -type f => real files only, skipping the symlinks automatically.
+            find "$dir" -maxdepth 1 -type f \( "$@" \) 2>/dev/null \
+            | while IFS= read -r real; do
+                [ -n "$real" ] || continue
+                local target
+                target=$(advertised_name "$real")
+                # De-dup: if two real files advertise the same name, first wins
+                # (shouldn't happen, but guard against overwrites).
+                if [ -e "$out/$target" ]; then
+                  echo "  (skip dup) $(basename "$real") -> $target already present"
+                else
+                  cp "$real" "$out/$target"
+                  echo "  $(basename "$real") -> $target"
+                fi
+              done
+          }
 
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            echo "=== macOS: install name (LC_ID_DYLIB) of each cgns file ==="
-            for f in $(find install_root -name 'libvtkcgns*.dylib' 2>/dev/null | sort); do
-              echo "--- $f ---"
-              otool -D "$f" || true
-            done
-            echo "=== macOS: are they real files or symlinks? ==="
-            find install_root -name 'libvtkcgns*.dylib' -exec ls -la {} \; 2>/dev/null || true
-            echo "=== macOS: what does a dependent (ChartsCore) ask for? ==="
-            cc=$(find install_root -name 'libvtkChartsCore*.dylib' 2>/dev/null | head -1)
-            [ -n "$cc" ] && otool -L "$cc" | grep -i cgns || echo "(no cgns dep shown)"
+          echo "=== flattening C++/third-party libs (lib/) ==="
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            copy_real_libs "install_root/bin" -name '*.dll'   # Windows DLLs live in bin/
+            copy_real_libs "install_root/lib" -name '*.dll'
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            copy_real_libs "install_root/lib" -name '*.dylib' -o -name '*.dylib.*'
           else
-            echo "=== Linux: SONAME of each cgns file ==="
-            for f in $(find install_root -name 'libvtkcgns*.so*' 2>/dev/null | sort); do
-              echo "--- $f ---"
-              readelf -d "$f" 2>/dev/null | grep -E 'SONAME' || true
-            done
-            echo "=== Linux: are they real files or symlinks? ==="
-            find install_root -name 'libvtkcgns*.so*' -exec ls -la {} \; 2>/dev/null || true
-            echo "=== Linux: what does a dependent (ChartsCore) ask for? ==="
-            cc=$(find install_root -name 'libvtkChartsCore*.so*' 2>/dev/null | head -1)
-            [ -n "$cc" ] && readelf -d "$cc" 2>/dev/null | grep -iE 'NEEDED.*cgns' || echo "(no cgns dep shown)"
+            copy_real_libs "install_root/lib" -name '*.so' -o -name '*.so.*'
           fi
+
+          echo "=== flattening JNI wrapper libs (lib/java/vtk-*) ==="
+          jnidir=$(find install_root -type d -path '*/java/vtk-*-*' 2>/dev/null | head -1)
+          if [ -n "$jnidir" ]; then
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              copy_real_libs "$jnidir" -name '*.dll'
+            elif [ "$RUNNER_OS" = "macOS" ]; then
+              copy_real_libs "$jnidir" -name '*.dylib' -o -name '*.dylib.*' -o -name '*.jnilib'
+            else
+              copy_real_libs "$jnidir" -name '*.so' -o -name '*.so.*'
+            fi
+          fi
+
+          # vtk.jar alongside (validated copy — reuse the same integrity check).
+          jar=""
+          while IFS= read -r cand; do
+            [ -n "$cand" ] || continue
+            if [ -s "$cand" ] && unzip -qt "$cand" >/dev/null 2>&1; then jar="$cand"; break; fi
+          done < <(find install_root build -name 'vtk.jar' -type f 2>/dev/null)
+          if [ -z "$jar" ]; then
+            echo "FAIL: no valid vtk.jar to include in the flattened output." >&2
+            exit 1
+          fi
+          cp "$jar" "$out/vtk.jar"
+
+          echo "=== flattened output ==="
+          ls -la "$out"
+          echo "file count: $(find "$out" -type f | wc -l)"
+          echo "total size: $(du -sh "$out" | cut -f1)"
 
       - name: Upload per-OS artifact
         uses: actions/upload-artifact@v7
         with:
           name: vtk-perOS-${{ matrix.sysname }}
-          # The whole install tree: native libs live under lib/java/... and the
-
-          # jar under lib/java/. Uploading install_root keeps the layout intact.
-          path: install_root
+          # Upload only the FLATTENED native dir (one real file per library +
+          # vtk.jar), not the whole install_root — that's what dedups the 3x
+          # symlink bloat and is exactly what Pyrus consumes.
+          path: dist-native
 
   merge:
     needs: build
@@ -440,49 +499,75 @@ jobs:
           pattern: vtk-perOS-*
           path: staging
 
-      # Assemble a single distributable tree:
-      #   dist/vtk.jar                          (platform-independent; ship once)
-      #   dist/natives/Linux/*.so
-      #   dist/natives/Darwin/*.dylib
-      #   dist/natives/Windows/*.dll
-      # vtk.jar is pure Java and identical across OSes, so we keep one copy and
-      # fail if the copies diverge (a sign the module set differed per-OS).
+      # Assemble the Pyrus-ready distribution tree:
+      #   dist/vtk.jar             (platform-independent Java classes; one copy)
+      #   dist/windows/*.dll       (flattened native libs, one real file each)
+      #   dist/linux/*.so*
+      #   dist/darwin/*.dylib
+      # Folder names are the OS tokens Pyrus's Installer expects. The per-OS
+      # artifacts are ALREADY flattened (one real file per lib) by the build
+      # job, so here we just place them under the right OS folder and lift out
+      # the single shared vtk.jar.
       - name: Assemble unified distribution
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist/natives
+          mkdir -p dist
+
+          # Map the matrix sysname (used in the artifact name) to the Pyrus OS
+          # folder token.
+          os_token () {
+            case "$1" in
+              Linux)   echo linux ;;
+              Darwin)  echo darwin ;;
+              Windows) echo windows ;;
+              *) echo "UNKNOWN_$1" ;;
+            esac
+          }
 
           jar_hash=""
           for d in staging/vtk-perOS-*/; do
             sys="${d#staging/vtk-perOS-}"; sys="${sys%/}"
+            token=$(os_token "$sys")
+            echo "=== $sys -> dist/$token ==="
 
-            # --- one shared vtk.jar ---
-            found_jar=$(find "$d" -name 'vtk.jar' | head -1 || true)
+            # Lift out the single shared vtk.jar (identical across platforms);
+            # warn if a later platform's jar differs (module-set mismatch).
+            found_jar=$(find "$d" -name 'vtk.jar' -type f | head -1 || true)
             if [ -n "$found_jar" ]; then
               h=$(sha256sum "$found_jar" | cut -d' ' -f1)
               if [ -z "$jar_hash" ]; then
-                jar_hash="$h"
-                cp "$found_jar" dist/vtk.jar
+                jar_hash="$h"; cp "$found_jar" dist/vtk.jar
               elif [ "$h" != "$jar_hash" ]; then
                 echo "WARN: vtk.jar from $sys differs from the first one." >&2
-                echo "      (module set may differ across platforms)" >&2
               fi
             fi
 
-            # --- per-OS native libs ---
-            mkdir -p "dist/natives/${sys}"
-            find "$d" \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \
-              -o -name '*.jnilib' -o -name '*.dll' \) -type f \
-              -exec cp {} "dist/natives/${sys}/" \; 2>/dev/null || true
+            # Everything except the jar is a native lib -> OS folder.
+            mkdir -p "dist/$token"
+            find "$d" -type f ! -name 'vtk.jar' -exec cp {} "dist/$token/" \;
           done
 
-          echo "=== assembled distribution ==="
+          echo "=== assembled Pyrus-ready distribution ==="
           find dist -type f | sort
-          echo "=== native lib counts per platform ==="
-          for p in dist/natives/*/; do
-            printf "%s: %d libs\n" "$(basename "$p")" "$(find "$p" -type f | wc -l)"
+          echo "=== per-platform summary ==="
+          [ -f dist/vtk.jar ] && echo "vtk.jar: present ($(du -h dist/vtk.jar | cut -f1))"
+          for p in dist/*/; do
+            [ -d "$p" ] || continue
+            printf "%s: %d libs, %s\n" "$(basename "$p")" \
+              "$(find "$p" -type f | wc -l)" "$(du -sh "$p" | cut -f1)"
           done
+
+      - name: Upload unified VTK Java artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: vtk-java-all-platforms
+          path: dist
+
+      - name: Delete intermediate per-OS artifacts
+        uses: geekyeggo/delete-artifact@v6
+        with:
+          name: vtk-perOS-*
 
       - name: Upload unified VTK Java artifact
         uses: actions/upload-artifact@v7
