@@ -285,7 +285,54 @@ jobs:
             exit 1
           fi
           echo "OK: JNI entry points present."
-
+          
+      # Runtime smoke test: proves the native libs actually LOAD and RUN in a
+      # JVM, not just that they built and export symbols. Compiles a tiny Java
+      # class against vtk.jar and runs it with -Dvtk.lib.dir pointing at the
+      # per-platform native dir (lib/java/vtk-<System>-<Processor>). VTK's own
+      # loader then loads by absolute path and patches java.library.path so
+      # sibling deps resolve — no per-OS LD_LIBRARY_PATH/DYLD/ PATH juggling.
+      #
+      # Runs on ALL THREE platforms (bash is available on Windows via Git-Bash).
+      # This deliberately tests library soundness in the friendly flat-dir CI
+      # case; it is NOT a test of downstream NetBeans-style loading logic.
+      - name: Runtime smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+ 
+          # Discover vtk.jar (pure-Java, one copy) and the single per-platform
+          # native dir, rather than hardcoding names that vary by OS/arch
+          # (vtk-Linux-x86_64 / vtk-Darwin-arm64 / vtk-Windows-AMD64 ...).
+          jar=$(find install_root build -name 'vtk.jar' -type f 2>/dev/null | head -1)
+          libdir=$(find install_root build -type d -name 'vtk-*-*' 2>/dev/null \
+                   | grep -E '/java/vtk-[^/]+-[^/]+$' | head -1)
+ 
+          if [ -z "$jar" ] || [ -z "$libdir" ]; then
+            echo "FAIL: could not locate vtk.jar ('$jar') or native dir ('$libdir')." >&2
+            echo "--- candidates ---" >&2
+            find install_root build -name 'vtk.jar' 2>/dev/null >&2 || true
+            find install_root build -type d -name 'vtk-*' 2>/dev/null >&2 || true
+            exit 1
+          fi
+          echo "Using jar:    $jar"
+          echo "Using libdir: $libdir"
+ 
+          # Classpath separator differs: ';' on Windows, ':' elsewhere.
+          case "$RUNNER_OS" in
+            Windows) SEP=';' ;;
+            *)       SEP=':' ;;
+          esac
+ 
+          # Compile the smoke test against vtk.jar, then run it. The test lives
+          # in the repo at .github/smoke/VtkSmokeTest.java (default package).
+          src=".github/smoke/VtkSmokeTest.java"
+          mkdir -p smoke-out
+          javac -cp "$jar" -d smoke-out "$src"
+ 
+          echo "=== running smoke test ==="
+          java -cp "smoke-out${SEP}${jar}" -Dvtk.lib.dir="$libdir" VtkSmokeTest
+          
       - name: Upload per-OS artifact
         uses: actions/upload-artifact@v7
         with:
