@@ -24,7 +24,7 @@ env:
   # Route the compiler through sccache and cap the on-disk cache so it fits
   # within GitHub's ~10 GB per-repo Actions cache budget across 3 platforms.
   SCCACHE_GHA_ENABLED: 'true'
-  SCCACHE_CACHE_SIZE: '2G'
+  SCCACHE_CACHE_SIZE: '3G'
   
 jobs:
   build:
@@ -333,6 +333,56 @@ jobs:
           echo "=== running smoke test ==="
           java -cp "smoke-out${SEP}${jar}" -Dvtk.lib.dir="$libdir" VtkSmokeTest
           
+      # TEMPORARY DIAGNOSTIC — remove once the SONAME/install-name trim is built.
+      # Prints the real linkage recorded INSIDE the binaries (not filenames) so
+      # we can key the trim on ground truth. On a triple like
+      #   libvtkcgns-9.6.dylib / -9.6.1.dylib / -9.6.9.6.dylib
+      # this shows which name each lib advertises (install name / SONAME) and
+      # which name its dependents actually ask for (LC_LOAD_DYLIB / NEEDED).
+      # Linux+macOS only; Windows DLLs don't use the versioned-symlink scheme.
+      - name: Inspect library linkage (diagnostic, Linux/macOS)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          libdir=$(find install_root build -type d -name 'vtk-*-*' 2>/dev/null \
+                   | grep -E '/java/vtk-[^/]+-[^/]+$' | head -1)
+          # Also inspect the C++ lib dir (the kits/third-party live here; the
+          # cgns triple you saw is a bundled third-party lib, not a JNI lib).
+          cxxdir=$(find install_root -type d -name lib 2>/dev/null | head -1)
+          echo "JNI dir: $libdir"
+          echo "C++ dir: $cxxdir"
+ 
+          echo "=== count of files that look like versioned duplicates ==="
+          find install_root -type f \( -name '*.so.*' -o -name '*-*.*.dylib' \) 2>/dev/null | wc -l
+ 
+          echo "=== sample: all files in the cgns triple ==="
+          find install_root -name 'libvtkcgns*' 2>/dev/null | sort
+ 
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            echo "=== macOS: install name (LC_ID_DYLIB) of each cgns file ==="
+            for f in $(find install_root -name 'libvtkcgns*.dylib' 2>/dev/null | sort); do
+              echo "--- $f ---"
+              otool -D "$f" || true
+            done
+            echo "=== macOS: are they real files or symlinks? ==="
+            find install_root -name 'libvtkcgns*.dylib' -exec ls -la {} \; 2>/dev/null || true
+            echo "=== macOS: what does a dependent (ChartsCore) ask for? ==="
+            cc=$(find install_root -name 'libvtkChartsCore*.dylib' 2>/dev/null | head -1)
+            [ -n "$cc" ] && otool -L "$cc" | grep -i cgns || echo "(no cgns dep shown)"
+          else
+            echo "=== Linux: SONAME of each cgns file ==="
+            for f in $(find install_root -name 'libvtkcgns*.so*' 2>/dev/null | sort); do
+              echo "--- $f ---"
+              readelf -d "$f" 2>/dev/null | grep -E 'SONAME' || true
+            done
+            echo "=== Linux: are they real files or symlinks? ==="
+            find install_root -name 'libvtkcgns*.so*' -exec ls -la {} \; 2>/dev/null || true
+            echo "=== Linux: what does a dependent (ChartsCore) ask for? ==="
+            cc=$(find install_root -name 'libvtkChartsCore*.so*' 2>/dev/null | head -1)
+            [ -n "$cc" ] && readelf -d "$cc" 2>/dev/null | grep -iE 'NEEDED.*cgns' || echo "(no cgns dep shown)"
+          fi
+           
       - name: Upload per-OS artifact
         uses: actions/upload-artifact@v7
         with:
