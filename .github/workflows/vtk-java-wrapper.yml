@@ -21,11 +21,15 @@ env:
   # Confirmed present on Maven Central (repo1.maven.org), which we fetch from
   # first; jogamp.org is an unreliable-from-CI fallback.
   JOGL_VERSION: '2.6.0'
-  # Route the compiler through sccache and cap the on-disk cache so it fits
-  # within GitHub's ~10 GB per-repo Actions cache budget across 3 platforms.
+  # Route the compiler through sccache. GHA backend stores the cache in the
+  # GitHub Actions cache. NOTE: on VTK this currently gives near-zero hit rate
+  # because a full VTK object set is far larger than GitHub's ~10 GB per-repo
+  # cache budget across 3 platforms, so the cache thrashes/evicts. Kept in
+  # place (harmless) in case a future setup — bigger cache, S3/R2 backend, or
+  # fewer modules — makes it worthwhile. Not currently providing real speedup.
   SCCACHE_GHA_ENABLED: 'true'
   SCCACHE_CACHE_SIZE: '3G'
-  
+
 jobs:
   build:
     strategy:
@@ -138,6 +142,9 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      # Install sccache + wire it to the GHA cache backend. Before Configure so
+      # it's on PATH when the CMAKE_*_COMPILER_LAUNCHER flags reference it.
+      # (Currently low hit-rate on VTK — see the SCCACHE_* env note above.)
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.10
 
@@ -285,7 +292,7 @@ jobs:
             exit 1
           fi
           echo "OK: JNI entry points present."
-          
+
       # Runtime smoke test: proves the native libs actually LOAD and RUN in a
       # JVM, not just that they built and export symbols. Compiles a tiny Java
       # class against vtk.jar and runs it with -Dvtk.lib.dir pointing at the
@@ -300,39 +307,67 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
- 
-          # Discover vtk.jar (pure-Java, one copy) and the single per-platform
-          # native dir, rather than hardcoding names that vary by OS/arch
-          # (vtk-Linux-x86_64 / vtk-Darwin-arm64 / vtk-Windows-AMD64 ...).
-          jar=$(find install_root build -name 'vtk.jar' -type f 2>/dev/null | head -1)
+
+          # Discover vtk.jar and the single per-platform native dir, rather than
+          # hardcoding names that vary by OS/arch (vtk-Linux-x86_64 /
+          # vtk-Darwin-arm64 / vtk-Windows-AMD64 ...).
+          #
+          # There can be MORE THAN ONE vtk.jar (build/ and install_root/), and
+          # on some platforms one copy can be truncated/incomplete ("zip END
+          # header not found"). So don't just take head -1 — pick the first
+          # candidate that is a VALID, non-empty zip.
           libdir=$(find install_root build -type d -name 'vtk-*-*' 2>/dev/null \
                    | grep -E '/java/vtk-[^/]+-[^/]+$' | head -1)
- 
+
+          echo "=== all vtk.jar candidates (size shown) ==="
+          find install_root build -name 'vtk.jar' -type f 2>/dev/null \
+            -exec ls -l {} \; || true
+
+          jar=""
+          while IFS= read -r cand; do
+            [ -n "$cand" ] || continue
+            # Must be non-empty AND a valid zip. `unzip -t` (or jar tf) fails on
+            # a truncated jar with exactly the "END header not found" error we
+            # saw on macOS. Prefer the first that passes.
+            if [ -s "$cand" ] && unzip -qt "$cand" >/dev/null 2>&1; then
+              jar="$cand"
+              break
+            else
+              echo "  SKIP (invalid/empty zip): $cand"
+            fi
+          done < <(find install_root build -name 'vtk.jar' -type f 2>/dev/null)
+
           if [ -z "$jar" ] || [ -z "$libdir" ]; then
-            echo "FAIL: could not locate vtk.jar ('$jar') or native dir ('$libdir')." >&2
-            echo "--- candidates ---" >&2
-            find install_root build -name 'vtk.jar' 2>/dev/null >&2 || true
+            echo "FAIL: no VALID vtk.jar (or no native dir) found." >&2
+            echo "  jar='$jar' libdir='$libdir'" >&2
+            echo "--- jar candidates ---" >&2
+            find install_root build -name 'vtk.jar' 2>/dev/null -exec ls -l {} \; >&2 || true
+            echo "--- native dirs ---" >&2
             find install_root build -type d -name 'vtk-*' 2>/dev/null >&2 || true
             exit 1
           fi
           echo "Using jar:    $jar"
           echo "Using libdir: $libdir"
- 
+
           # Classpath separator differs: ';' on Windows, ':' elsewhere.
           case "$RUNNER_OS" in
             Windows) SEP=';' ;;
             *)       SEP=':' ;;
           esac
- 
+
           # Compile the smoke test against vtk.jar, then run it. The test lives
           # in the repo at .github/smoke/VtkSmokeTest.java (default package).
           src=".github/smoke/VtkSmokeTest.java"
           mkdir -p smoke-out
           javac -cp "$jar" -d smoke-out "$src"
- 
+
           echo "=== running smoke test ==="
-          java -cp "smoke-out${SEP}${jar}" -Dvtk.lib.dir="$libdir" VtkSmokeTest
-          
+          # --enable-native-access=ALL-UNNAMED silences the Java 25 "restricted
+          # method Runtime::load" warning (which becomes a hard error in a
+          # future JDK). vtk.jar is an unnamed module, hence ALL-UNNAMED.
+          java --enable-native-access=ALL-UNNAMED \
+            -cp "smoke-out${SEP}${jar}" -Dvtk.lib.dir="$libdir" VtkSmokeTest
+
       # TEMPORARY DIAGNOSTIC — remove once the SONAME/install-name trim is built.
       # Prints the real linkage recorded INSIDE the binaries (not filenames) so
       # we can key the trim on ground truth. On a triple like
@@ -352,13 +387,13 @@ jobs:
           cxxdir=$(find install_root -type d -name lib 2>/dev/null | head -1)
           echo "JNI dir: $libdir"
           echo "C++ dir: $cxxdir"
- 
+
           echo "=== count of files that look like versioned duplicates ==="
           find install_root -type f \( -name '*.so.*' -o -name '*-*.*.dylib' \) 2>/dev/null | wc -l
- 
+
           echo "=== sample: all files in the cgns triple ==="
           find install_root -name 'libvtkcgns*' 2>/dev/null | sort
- 
+
           if [ "$RUNNER_OS" = "macOS" ]; then
             echo "=== macOS: install name (LC_ID_DYLIB) of each cgns file ==="
             for f in $(find install_root -name 'libvtkcgns*.dylib' 2>/dev/null | sort); do
@@ -382,12 +417,13 @@ jobs:
             cc=$(find install_root -name 'libvtkChartsCore*.so*' 2>/dev/null | head -1)
             [ -n "$cc" ] && readelf -d "$cc" 2>/dev/null | grep -iE 'NEEDED.*cgns' || echo "(no cgns dep shown)"
           fi
-           
+
       - name: Upload per-OS artifact
         uses: actions/upload-artifact@v7
         with:
           name: vtk-perOS-${{ matrix.sysname }}
           # The whole install tree: native libs live under lib/java/... and the
+
           # jar under lib/java/. Uploading install_root keeps the layout intact.
           path: install_root
 
