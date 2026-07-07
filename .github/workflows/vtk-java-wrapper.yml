@@ -355,6 +355,23 @@ jobs:
             *)       SEP=':' ;;
           esac
 
+          # --- Windows inter-DLL dependency resolution ---
+          # On Windows, System.load() finds the named DLL, but Windows resolves
+          # THAT DLL's dependencies (vtkRenderingCore-9.6.dll etc.) via the
+          # standard DLL search order, which does NOT include the loaded DLL's
+          # own directory and does NOT consult java.library.path. It DOES
+          # include PATH. The C++ DLLs install to bin/ and the JNI DLLs to
+          # lib/java/vtk-*, so we must put BOTH on PATH or the JNI DLL loads but
+          # its siblings can't be found ("Can't find dependent libraries").
+          # (Linux/macOS don't need this: the loader patches java.library.path /
+          # uses @rpath + already-loaded images.) This mirrors what the Pyrus
+          # installer does with SetDllDirectoryA.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bindir=$(find install_root -type d -name bin 2>/dev/null | head -1)
+            echo "Prepending to PATH: $libdir ; $bindir"
+            export PATH="${libdir};${bindir};${PATH}"
+          fi
+
           # Compile the smoke test against vtk.jar, then run it. The test lives
           # in the repo at .github/smoke/VtkSmokeTest.java (default package).
           src=".github/smoke/VtkSmokeTest.java"
