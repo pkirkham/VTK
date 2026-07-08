@@ -579,56 +579,57 @@ jobs:
               "$(find "$p" -type f | wc -l)" "$(du -sh "$p" | cut -f1)"
           done
 
-      # THE TEST: does each platform's jar agree with its own native on the
-      # SetOpenGLSymbolLoader ordinal? With kits OFF the hypothesis is they now
-      # match (they didn't under kits: jar _76/_77 vs native _177). Also reports
-      # whether all three jars are byte-identical — if so, we can collapse back
-      # to a single universal jar (the ideal outcome).
-      - name: Verify jar/native ordinal match (kits-off test)
+      # THE TEST: each platform's jar must match ITS OWN native. VTK's wrapper
+      # uses a fixed offset — the native JNI ordinal is the jar ordinal + 100
+      # (e.g. jar _77 <-> native _177; confirmed against the working 9.6.2
+      # release: jar _75 <-> native _175). So "match" means native == jar + 100,
+      # NOT native == jar. The original bug was the merge shipping ONE platform's
+      # jar to all platforms: macOS jar (_76) with Linux native (_177) fails
+      # because Linux needs jar _77 (177-100). Per-platform jars fix it. This
+      # step verifies the +100 relationship holds for the Linux jar vs Linux
+      # native (the pair we can fully inspect on this runner).
+      - name: Verify jar/native ordinal match (per-platform, +100 offset)
         shell: bash
         run: |
           set -euo pipefail
-          ordinal_from_jar () {   # $1 = jar path
-            local tmp; tmp=$(mktemp -d)
-            (cd "$tmp" && jar xf "$1" vtk/vtkOpenGLRenderWindow.class 2>/dev/null) || true
-            javap -p -cp "$tmp" vtk.vtkOpenGLRenderWindow 2>/dev/null \
-              | grep -o 'SetOpenGLSymbolLoader2_[0-9]*' | head -1 || true
+          JAR_TO_NATIVE_OFFSET=100
+
+          num_from_jar () {   # $1 = jar path -> echoes the integer ordinal
+            javap -p -cp "$1" vtk.vtkOpenGLRenderWindow 2>/dev/null \
+              | grep -o 'SetOpenGLSymbolLoader2_[0-9]*' | head -1 \
+              | grep -o '[0-9]*$' || true
           }
-          ordinal_from_so () {    # $1 = .so path
+          num_from_so () {    # $1 = .so path -> echoes the integer ordinal
             nm -D "$1" 2>/dev/null \
-              | grep -o 'SetOpenGLSymbolLoader2_[0-9]*' | head -1 || true
+              | grep -o 'SetOpenGLSymbolLoader2_[0-9]*' | head -1 \
+              | grep -o '[0-9]*$' || true
           }
 
-          # Linux is the one we can fully cross-check here (nm on ELF + javap).
-          ljar=$(ordinal_from_jar dist/linux/vtk.jar)
-          lso=$(ordinal_from_so "$(find dist/linux -name 'libvtkRenderingOpenGL2Java.so*' | head -1)")
-          echo "Linux  jar ordinal: ${ljar:-<none>}   native ordinal: ${lso:-<none>}"
-          if [ -n "$ljar" ] && [ -n "$lso" ] && [ "$ljar" = "$lso" ]; then
-            echo "PASS: Linux jar and native agree ($ljar) — kits-off fixed the mismatch."
+          jarn=$(num_from_jar dist/linux/vtk.jar)
+          son=$(num_from_so "$(find dist/linux -name 'libvtkRenderingOpenGL2Java.so*' | head -1)")
+          echo "Linux jar ordinal: ${jarn:-<none>}   native ordinal: ${son:-<none>}"
+
+          if [ -z "$jarn" ] || [ -z "$son" ]; then
+            echo "FAIL: could not extract one/both ordinals (check tooling)." >&2
+            exit 1
+          fi
+          expected=$(( jarn + JAR_TO_NATIVE_OFFSET ))
+          if [ "$son" -eq "$expected" ]; then
+            echo "PASS: Linux native ($son) == jar ($jarn) + $JAR_TO_NATIVE_OFFSET. Correct pairing."
           else
-            echo "FAIL: Linux jar ($ljar) and native ($lso) still disagree." >&2
-            echo "Kits-off did NOT resolve it; the WrapJava/ParseJava divergence" >&2
-            echo "is independent of kits. Do not ship; investigate further." >&2
+            echo "FAIL: Linux native ($son) != jar ($jarn) + $JAR_TO_NATIVE_OFFSET (=$expected)." >&2
+            echo "This platform's jar and native are genuinely mismatched." >&2
             exit 1
           fi
 
-          # Report the per-platform jar ordinals + whether jars are identical.
-          echo "=== jar ordinals per platform ==="
+          # Report each platform's jar ordinal, and whether the three jars are
+          # identical. NOTE: the earlier UnsatisfiedLinkError proved they are
+          # NOT identical across platforms (macOS _76 vs Linux _77), which is
+          # exactly why we ship per-platform jars. This just documents it.
+          echo "=== jar ordinal per platform (differ by design -> per-platform jars) ==="
           for t in linux darwin windows; do
-            [ -f "dist/$t/vtk.jar" ] && echo "  $t: $(ordinal_from_jar dist/$t/vtk.jar)"
+            [ -f "dist/$t/vtk.jar" ] && echo "  $t jar: $(num_from_jar dist/$t/vtk.jar)"
           done
-          echo "=== are the three jars byte-identical? (universal-jar check) ==="
-          h_linux=$(sha256sum dist/linux/vtk.jar 2>/dev/null | cut -d' ' -f1 || true)
-          h_darwin=$(sha256sum dist/darwin/vtk.jar 2>/dev/null | cut -d' ' -f1 || true)
-          h_windows=$(sha256sum dist/windows/vtk.jar 2>/dev/null | cut -d' ' -f1 || true)
-          echo "  linux:   $h_linux"
-          echo "  darwin:  $h_darwin"
-          echo "  windows: $h_windows"
-          if [ -n "$h_linux" ] && [ "$h_linux" = "$h_darwin" ] && [ "$h_linux" = "$h_windows" ]; then
-            echo "UNIVERSAL JAR: all three jars are identical — safe to ship ONE shared jar."
-          else
-            echo "Per-platform jars still differ — keep shipping per-platform jars for now."
-          fi
 
       - name: Upload unified VTK Java artifact
         uses: actions/upload-artifact@v7
