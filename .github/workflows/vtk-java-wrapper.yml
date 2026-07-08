@@ -490,6 +490,34 @@ jobs:
           fi
           cp "$jar" "$out/vtk.jar"
 
+          # Record the VTK major.minor version parsed from an actual shipped
+          # native library filename (e.g. libvtkCommonCore-9.6.so ->  9.6). We
+          # use major.minor only because that's all the filenames carry on ALL
+          # platforms consistently — Windows DLLs are "-9.6.dll" with no patch,
+          # so major.minor is the common denominator. Derived from what's really
+          # in the bundle, not a separate source. Used by the merge to name the
+          # per-platform jars vtk-<os>-<major.minor>.jar.
+          vtk_ver=$(
+            find "$out" -maxdepth 1 -type f \
+              \( -name '*vtkCommonCore-*' -o -name '*vtkCommon-*' \) 2>/dev/null \
+            | head -1 \
+            | grep -oE '[0-9]+\.[0-9]+' | head -1
+          )
+          # Fallback: scan any versioned vtk library if the above didn't match.
+          if [ -z "$vtk_ver" ]; then
+            vtk_ver=$(
+              find "$out" -maxdepth 1 -type f -name '*vtk*-*.*' 2>/dev/null \
+              | grep -oE 'vtk[A-Za-z0-9]*-[0-9]+\.[0-9]+' | head -1 \
+              | grep -oE '[0-9]+\.[0-9]+' | head -1
+            )
+          fi
+          if [ -z "$vtk_ver" ]; then
+            echo "FAIL: could not parse VTK major.minor from any native filename." >&2
+            exit 1
+          fi
+          echo "$vtk_ver" > "$out/VERSION"
+          echo "VTK version (major.minor) recorded from library names: $vtk_ver"
+
           echo "=== flattened output ==="
           ls -la "$out"
           echo "file count: $(find "$out" -type f | wc -l)"
@@ -532,9 +560,9 @@ jobs:
       # platform paired with another's natives throws UnsatisfiedLinkError on
       # the mismatched methods. So we ship ONE jar PER PLATFORM, inside that
       # platform's folder, next to its natives:
-      #   dist/linux/vtk.jar   + dist/linux/*.so
-      #   dist/darwin/vtk.jar  + dist/darwin/*.dylib
-      #   dist/windows/vtk.jar + dist/windows/*.dll
+      #   dist/linux/vtk-linux-<ver>.jar     + dist/linux/*.so
+      #   dist/darwin/vtk-darwin-<ver>.jar   + dist/darwin/*.dylib
+      #   dist/windows/vtk-windows-<ver>.jar + dist/windows/*.dll
       - name: Assemble unified distribution
         shell: bash
         run: |
@@ -555,16 +583,29 @@ jobs:
             token=$(os_token "$sys")
             echo "=== $sys -> dist/$token ==="
             mkdir -p "dist/$token"
-            # Copy EVERYTHING for this platform — natives AND its own vtk.jar —
-            # into the platform folder. The jar is platform-specific (see above)
-            # so it must stay with its matching natives.
-            find "$d" -type f -exec cp {} "dist/$token/" \;
-            # Sanity: confirm this platform's jar and its RenderingOpenGL2 JNI
-            # lib agree on the SetOpenGLSymbolLoader ordinal — the exact
-            # mismatch that bit us. Best-effort, non-fatal (tools vary per
-            # runner), but prints a loud line if they diverge.
+
+            # Read the major.minor version this platform recorded (from its own
+            # library filenames) so the jar can be named vtk-<os>-<ver>.jar.
+            ver=""
+            [ -f "$d/VERSION" ] && ver=$(tr -d '[:space:]' < "$d/VERSION")
+
+            # Copy everything for this platform EXCEPT the VERSION carrier file
+            # (it's metadata, not a shipped artifact) into the platform folder.
+            find "$d" -type f ! -name 'VERSION' -exec cp {} "dist/$token/" \;
+
+            # Rename this platform's jar to vtk-<os>-<ver>.jar so it is
+            # self-identifying — a darwin jar can never be mistaken for windows,
+            # and the version is visible at a glance. The jar is platform-
+            # specific (macOS _76 vs win/linux _77), so it must stay with its
+            # matching natives; the descriptive name makes that pairing obvious.
             if [ -f "dist/$token/vtk.jar" ]; then
-              echo "  vtk.jar present for $token"
+              if [ -n "$ver" ]; then
+                mv "dist/$token/vtk.jar" "dist/$token/vtk-${token}-${ver}.jar"
+                echo "  jar -> vtk-${token}-${ver}.jar"
+              else
+                mv "dist/$token/vtk.jar" "dist/$token/vtk-${token}.jar"
+                echo "  WARN: no VERSION for $token; jar -> vtk-${token}.jar" >&2
+              fi
             else
               echo "  WARN: no vtk.jar for $token!" >&2
             fi
@@ -605,7 +646,7 @@ jobs:
               | grep -o '[0-9]*$' || true
           }
 
-          jarn=$(num_from_jar dist/linux/vtk.jar)
+          jarn=$(num_from_jar "$(find dist/linux -name 'vtk-linux-*.jar' -o -name 'vtk-linux.jar' 2>/dev/null | head -1)")
           son=$(num_from_so "$(find dist/linux -name 'libvtkRenderingOpenGL2Java.so*' | head -1)")
           echo "Linux jar ordinal: ${jarn:-<none>}   native ordinal: ${son:-<none>}"
 
@@ -628,7 +669,8 @@ jobs:
           # exactly why we ship per-platform jars. This just documents it.
           echo "=== jar ordinal per platform (differ by design -> per-platform jars) ==="
           for t in linux darwin windows; do
-            [ -f "dist/$t/vtk.jar" ] && echo "  $t jar: $(num_from_jar dist/$t/vtk.jar)"
+            j=$(find "dist/$t" -name "vtk-$t-*.jar" -o -name "vtk-$t.jar" 2>/dev/null | head -1)
+            [ -n "$j" ] && echo "  $t jar: $(num_from_jar "$j")"
           done
 
       - name: Upload unified VTK Java artifact
