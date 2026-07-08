@@ -161,7 +161,7 @@ jobs:
           fi
           cmake -B build -S . $GEN_ARGS \
             -DVTK_BUILD_SHARED_LIBS=ON \
-            -DVTK_ENABLE_KITS=ON \
+            -DVTK_ENABLE_KITS=OFF \
             -DVTK_WRAP_JAVA=ON \
             -DVTK_JAVA_JOGL_COMPONENT=ON \
             -DJOGL_VERSION="${JOGL_VERSION}" \
