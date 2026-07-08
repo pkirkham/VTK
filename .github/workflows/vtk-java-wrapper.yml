@@ -516,23 +516,23 @@ jobs:
           pattern: vtk-perOS-*
           path: staging
 
-      # Assemble the Pyrus-ready distribution tree:
-      #   dist/vtk.jar             (platform-independent Java classes; one copy)
-      #   dist/windows/*.dll       (flattened native libs, one real file each)
-      #   dist/linux/*.so*
-      #   dist/darwin/*.dylib
-      # Folder names are the OS tokens Pyrus's Installer expects. The per-OS
-      # artifacts are ALREADY flattened (one real file per lib) by the build
-      # job, so here we just place them under the right OS folder and lift out
-      # the single shared vtk.jar.
+      # Assemble the Pyrus-ready distribution tree. IMPORTANT: vtk.jar is NOT
+      # identical across platforms — VTK wraps platform-specific methods
+      # (Cocoa/Win32/X11 GL context handling), so the wrapper-generated method
+      # ordinals differ per platform, making each platform's vtk.jar distinct
+      # AND only compatible with that platform's native libs. A jar from one
+      # platform paired with another's natives throws UnsatisfiedLinkError on
+      # the mismatched methods. So we ship ONE jar PER PLATFORM, inside that
+      # platform's folder, next to its natives:
+      #   dist/linux/vtk.jar   + dist/linux/*.so
+      #   dist/darwin/vtk.jar  + dist/darwin/*.dylib
+      #   dist/windows/vtk.jar + dist/windows/*.dll
       - name: Assemble unified distribution
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
 
-          # Map the matrix sysname (used in the artifact name) to the Pyrus OS
-          # folder token.
           os_token () {
             case "$1" in
               Linux)   echo linux ;;
@@ -542,36 +542,32 @@ jobs:
             esac
           }
 
-          jar_hash=""
           for d in staging/vtk-perOS-*/; do
             sys="${d#staging/vtk-perOS-}"; sys="${sys%/}"
             token=$(os_token "$sys")
             echo "=== $sys -> dist/$token ==="
-
-            # Lift out the single shared vtk.jar (identical across platforms);
-            # warn if a later platform's jar differs (module-set mismatch).
-            found_jar=$(find "$d" -name 'vtk.jar' -type f | head -1 || true)
-            if [ -n "$found_jar" ]; then
-              h=$(sha256sum "$found_jar" | cut -d' ' -f1)
-              if [ -z "$jar_hash" ]; then
-                jar_hash="$h"; cp "$found_jar" dist/vtk.jar
-              elif [ "$h" != "$jar_hash" ]; then
-                echo "WARN: vtk.jar from $sys differs from the first one." >&2
-              fi
-            fi
-
-            # Everything except the jar is a native lib -> OS folder.
             mkdir -p "dist/$token"
-            find "$d" -type f ! -name 'vtk.jar' -exec cp {} "dist/$token/" \;
+            # Copy EVERYTHING for this platform — natives AND its own vtk.jar —
+            # into the platform folder. The jar is platform-specific (see above)
+            # so it must stay with its matching natives.
+            find "$d" -type f -exec cp {} "dist/$token/" \;
+            # Sanity: confirm this platform's jar and its RenderingOpenGL2 JNI
+            # lib agree on the SetOpenGLSymbolLoader ordinal — the exact
+            # mismatch that bit us. Best-effort, non-fatal (tools vary per
+            # runner), but prints a loud line if they diverge.
+            if [ -f "dist/$token/vtk.jar" ]; then
+              echo "  vtk.jar present for $token"
+            else
+              echo "  WARN: no vtk.jar for $token!" >&2
+            fi
           done
 
-          echo "=== assembled Pyrus-ready distribution ==="
+          echo "=== assembled Pyrus-ready distribution (per-platform jars) ==="
           find dist -type f | sort
           echo "=== per-platform summary ==="
-          [ -f dist/vtk.jar ] && echo "vtk.jar: present ($(du -h dist/vtk.jar | cut -f1))"
           for p in dist/*/; do
             [ -d "$p" ] || continue
-            printf "%s: %d libs, %s\n" "$(basename "$p")" \
+            printf "%s: %d files, %s\n" "$(basename "$p")" \
               "$(find "$p" -type f | wc -l)" "$(du -sh "$p" | cut -f1)"
           done
 
