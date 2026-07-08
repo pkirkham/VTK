@@ -184,20 +184,21 @@ jobs:
             -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded \
             -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
 
-      # Fail loudly if the dependent-option silently forced kits OFF (which
-      # happens if VTK_BUILD_SHARED_LIBS didn't take). Without this you'd only
-      # notice by counting 150 JNI libs at the end.
-      - name: Assert kits are enabled
+      # We are testing with kits OFF: the hypothesis is that VTK_ENABLE_KITS=ON
+      # caused the WrapJava (native .cxx) and ParseJava (.java class) generators
+      # to disagree on method ordinals, producing a jar and natives that can't
+      # bind (the SetOpenGLSymbolLoader2_76-vs-_177 UnsatisfiedLinkError). This
+      # step just confirms kits really is OFF so we know the test is valid.
+      - name: Confirm kits are disabled
         shell: bash
         run: |
           set -euo pipefail
-          if ! grep -q "^VTK_ENABLE_KITS:BOOL=ON" build/CMakeCache.txt; then
-            echo "FAIL: VTK_ENABLE_KITS is not ON in the cache — kits were" >&2
-            echo "force-disabled (likely VTK_BUILD_SHARED_LIBS is OFF)." >&2
-            grep -E "VTK_ENABLE_KITS|VTK_BUILD_SHARED_LIBS" build/CMakeCache.txt >&2 || true
+          if grep -q "^VTK_ENABLE_KITS:BOOL=ON" build/CMakeCache.txt; then
+            echo "FAIL: VTK_ENABLE_KITS is ON but we intended OFF for this test." >&2
             exit 1
           fi
-          echo "OK: kits enabled."
+          echo "OK: kits disabled (as intended for the ordinal-match test)."
+
 
       - name: Build and install
         shell: bash
@@ -510,6 +511,13 @@ jobs:
       contents: read
       actions: write
     steps:
+      - name: Setup Java JDK
+        uses: actions/setup-java@v5.4.0
+        with:
+          java-version: '25'
+          distribution: 'zulu'
+          java-package: 'jdk'
+
       - name: Download per-OS artifacts
         uses: actions/download-artifact@v8
         with:
@@ -570,6 +578,57 @@ jobs:
             printf "%s: %d files, %s\n" "$(basename "$p")" \
               "$(find "$p" -type f | wc -l)" "$(du -sh "$p" | cut -f1)"
           done
+
+      # THE TEST: does each platform's jar agree with its own native on the
+      # SetOpenGLSymbolLoader ordinal? With kits OFF the hypothesis is they now
+      # match (they didn't under kits: jar _76/_77 vs native _177). Also reports
+      # whether all three jars are byte-identical — if so, we can collapse back
+      # to a single universal jar (the ideal outcome).
+      - name: Verify jar/native ordinal match (kits-off test)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ordinal_from_jar () {   # $1 = jar path
+            local tmp; tmp=$(mktemp -d)
+            (cd "$tmp" && jar xf "$1" vtk/vtkOpenGLRenderWindow.class 2>/dev/null) || true
+            javap -p -cp "$tmp" vtk.vtkOpenGLRenderWindow 2>/dev/null \
+              | grep -o 'SetOpenGLSymbolLoader2_[0-9]*' | head -1 || true
+          }
+          ordinal_from_so () {    # $1 = .so path
+            nm -D "$1" 2>/dev/null \
+              | grep -o 'SetOpenGLSymbolLoader2_[0-9]*' | head -1 || true
+          }
+
+          # Linux is the one we can fully cross-check here (nm on ELF + javap).
+          ljar=$(ordinal_from_jar dist/linux/vtk.jar)
+          lso=$(ordinal_from_so "$(find dist/linux -name 'libvtkRenderingOpenGL2Java.so*' | head -1)")
+          echo "Linux  jar ordinal: ${ljar:-<none>}   native ordinal: ${lso:-<none>}"
+          if [ -n "$ljar" ] && [ -n "$lso" ] && [ "$ljar" = "$lso" ]; then
+            echo "PASS: Linux jar and native agree ($ljar) — kits-off fixed the mismatch."
+          else
+            echo "FAIL: Linux jar ($ljar) and native ($lso) still disagree." >&2
+            echo "Kits-off did NOT resolve it; the WrapJava/ParseJava divergence" >&2
+            echo "is independent of kits. Do not ship; investigate further." >&2
+            exit 1
+          fi
+
+          # Report the per-platform jar ordinals + whether jars are identical.
+          echo "=== jar ordinals per platform ==="
+          for t in linux darwin windows; do
+            [ -f "dist/$t/vtk.jar" ] && echo "  $t: $(ordinal_from_jar dist/$t/vtk.jar)"
+          done
+          echo "=== are the three jars byte-identical? (universal-jar check) ==="
+          h_linux=$(sha256sum dist/linux/vtk.jar 2>/dev/null | cut -d' ' -f1 || true)
+          h_darwin=$(sha256sum dist/darwin/vtk.jar 2>/dev/null | cut -d' ' -f1 || true)
+          h_windows=$(sha256sum dist/windows/vtk.jar 2>/dev/null | cut -d' ' -f1 || true)
+          echo "  linux:   $h_linux"
+          echo "  darwin:  $h_darwin"
+          echo "  windows: $h_windows"
+          if [ -n "$h_linux" ] && [ "$h_linux" = "$h_darwin" ] && [ "$h_linux" = "$h_windows" ]; then
+            echo "UNIVERSAL JAR: all three jars are identical — safe to ship ONE shared jar."
+          else
+            echo "Per-platform jars still differ — keep shipping per-platform jars for now."
+          fi
 
       - name: Upload unified VTK Java artifact
         uses: actions/upload-artifact@v7
